@@ -1,14 +1,15 @@
 import torch
 from torch import nn, Tensor
-from typing import Optional, Tuple, Dict, Any
+import torch.nn.functional as F
 
+from typing import Optional, Tuple, Dict, Any
 from .config import APDConfig
 from processor import APDProcessor
 from data import APDLMHeadModelOutput, APDModelOutput, APDProcessorOutput
 
 from transformers.models.vit.modeling_vit import ViTPatchEmbeddings
 from transformers.generation.logits_process import LogitsProcessorList
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block, GPT2Model,GPT2Attention
+from transformers.models.gpt2.modeling_gpt2 import GPT2Block, GPT2Model, GPT2Attention
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask_for_sdpa
 from transformers.generation.beam_search import BeamScorer, BeamSearchScorer
@@ -254,7 +255,7 @@ class APDLMHeadModel(nn.Module):
             multi_scale_features=self.transformer.multi_scale_extractor(
                 pixel_values)  # 添加这一行
         )
-        
+
         logits = self.language_model_head(transformer_output.hidden_states)
 
         loss, accuracy = None, None
