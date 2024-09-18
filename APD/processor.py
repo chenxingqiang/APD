@@ -2,7 +2,7 @@ from transformers import GPT2Tokenizer, AutoImageProcessor
 
 from PIL import Image
 from typing import List, Union
-from config import APDConfig
+from APD.config import APDConfig
 from data import APDProcessorOutput
 
 

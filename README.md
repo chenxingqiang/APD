@@ -78,6 +78,42 @@ The APD model consists of the following key components:
 
 Our ablation studies demonstrate that the APD model significantly outperforms baseline models, especially in challenging scenarios involving small or irregularly shaped text. The combination of multi-scale perception and dynamic feature fusion contributes to improved accuracy and robustness across various text recognition tasks.
 
+
+## Fine-tuning APD on IAM dataset
+
+This is an example of fine-tuning APD on IAM dataset handwritten words from [Kaggle](https://www.kaggle.com/datasets/teykaicong/iamondb-handwriting-dataset). IAM Aachen splits can be downloaded [here](https://www.openslr.org/56/).
+
+### Dataset folder structure
+
+```
+iam_words/
+│
+├── words/                              # Folder containing word images as PNGs
+│   ├── a01/                            # First folder
+│   │   ├── a01-000u/
+│   │   │   ├── a01-000u-00-00.png
+│   │   │   └── a01-000u-00-01.png
+│   │   .
+│   │   .
+│   │   .
+│   └── r06/                            # Last folder
+│       ├── r06-000/
+│       │   ├── r06-000-00-00.png
+│       │   └── r06-000-00-01.png
+│
+├── xml/                                # XML files
+│ ├── a01-000u.xml
+│ .
+│ .
+│ .
+│ └── r06-143.xml
+│
+└── splits/                             # IAM Aachen splits
+    ├── train.uttlist
+    ├── validation.uttlist
+    └── test.uttlist
+```
+
 ## Future Work
 
 We are continuously working on improving the APD model. Future directions include:
@@ -88,7 +124,7 @@ We are continuously working on improving the APD model. Future directions includ
 
 ## Acknowledgments
 
-This project builds upon the original work presented in [APD: Decoder-only Transformer for Optical Character Recognition](https://doi.org/10.48550/arXiv.2308.15996), authored by Masato Fujitake. We extend our gratitude for their significant contributions to the field.
+This project builds upon the original work presented in [Decoder-only Transformer for Optical Character Recognition](https://doi.org/10.48550/arXiv.2308.15996), authored by Masato Fujitake. We extend our gratitude for their significant contributions to the field.
 
 Additionally, we leverage the GPT-2 and Vision Transformer (ViT) models developed by Hugging Face, which have been instrumental in advancing our project's capabilities. Our sincere thanks go to the Hugging Face team for making such powerful tools accessible to the broader research community.
 
