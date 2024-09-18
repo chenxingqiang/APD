@@ -118,9 +118,9 @@ The **multi-scale perception module** is designed to extract visual features at 
 
 Let the input image be denoted as $\mathbf{X} \in \mathbb{R}^{H \times W \times 3}$, where $H$ and $W$ represent the height and width of the image, and 3 corresponds to the RGB color channels. The input is passed through $N$ convolutional layers, each denoted by $\text{Conv}_i$ for $i = 1, 2, ..., N$. These convolutional layers produce feature maps $\mathbf{F}_i$, which capture visual information at different levels of abstraction:
 
-$$
+$
 \mathbf{F}_i = \text{Conv}_i(\mathbf{X}), \quad i = 1, 2, ..., N
-$$
+$
 
 Each feature map $\mathbf{F}_i \in \mathbb{R}^{H_i \times W_i \times C_i}$ has its own spatial resolution and number of channels $C_i$. The resolution $H_i \times W_i$ typically decreases as the depth of the convolutional layers increases, reflecting the hierarchical nature of the feature extraction process. Lower layers capture fine details, while higher layers capture more abstract and global information.
 
@@ -134,21 +134,21 @@ Once multi-scale features have been extracted, the next step is to **fuse** thes
 
 The fusion process involves computing a weighted sum of the feature maps, where the weights are dynamically determined based on the input image. Let $\alpha_i$ denote the weight assigned to feature map $\mathbf{F}_i$. The fused feature map $\mathbf{F}_{\text{multi-scale}}$ is computed as:
 
-$$
+$
 \mathbf{F}_{\text{multi-scale}} = \sum_{i=1}^{N} \alpha_i \mathbf{F}_i
-$$
+$
 
 The weights $\alpha_i$ are not fixed but are learned dynamically based on the complexity of the image. Specifically, we employ an attention mechanism to calculate the weights. Given a global representation of each feature map, $\mathbf{G}_i$, the attention score $\alpha_i$ is computed as follows:
 
-$$
+$
 \alpha_i = \frac{\exp(\mathbf{W}_i \cdot \mathbf{G}_i)}{\sum_{j=1}^{N} \exp(\mathbf{W}_j \cdot \mathbf{G}_j)}
-$$
+$
 
 Here, $\mathbf{W}_i$ represents a learnable weight matrix for the $i$-th feature map, and $\mathbf{G}_i$ is the global representation of $\mathbf{F}_i$, typically obtained through global average pooling:
 
-$$
+$
 \mathbf{G}_i = \text{GlobalAvgPool}(\mathbf{F}_i)
-$$
+$
 
 The attention mechanism ensures that feature maps that contribute more to the task are assigned higher weights, thereby emphasizing the most relevant features. This dynamic fusion strategy enables the model to adaptively combine information from different scales, making it robust to variations in text size, shape, and scene complexity [1].
 
