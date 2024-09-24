@@ -1,9 +1,8 @@
 from transformers import GPT2Tokenizer, AutoImageProcessor
-
 from PIL import Image
 from typing import List, Union
 from APD.config import APDConfig
-from data import APDProcessorOutput
+from APD.data import APDProcessorOutput
 
 
 class APDProcessor:
@@ -20,16 +19,34 @@ class APDProcessor:
             config.gpt2_hf_model,
             add_bos_token=add_bos_token,
             model_max_length=config.max_position_embeddings - int(
-                (config.image_size[0] / config.patch_size[0]) * (config.image_size[1] / config.patch_size[1])
+                (config.image_size[0] / config.patch_size[0]) *
+                (config.image_size[1] / config.patch_size[1])
             )
         )
         self.tokeniser.pad_token = self.tokeniser.bos_token
-        self.tokeniser.add_eos_token = add_eos_token
+        self.add_bos_token = add_bos_token
+        self.add_eos_token = add_eos_token
 
-        # Bind a new method to gpt2_tokeniser
-        self.tokeniser.build_inputs_with_special_tokens = modified_build_inputs_with_special_tokens.__get__(
-            self.tokeniser
-        )
+        # Override the build_inputs_with_special_tokens method
+        self.tokeniser.build_inputs_with_special_tokens = self.modified_build_inputs_with_special_tokens
+
+    def modified_build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
+        if self.add_bos_token:
+            bos_token_ids = [self.tokeniser.bos_token_id]
+        else:
+            bos_token_ids = []
+
+        if self.add_eos_token:
+            eos_token_ids = [self.tokeniser.eos_token_id]
+        else:
+            eos_token_ids = []
+
+        output = bos_token_ids + token_ids_0 + eos_token_ids
+
+        if token_ids_1 is None:
+            return output
+
+        return output + bos_token_ids + token_ids_1
 
     def __call__(
         self,
@@ -55,22 +72,3 @@ class APDProcessor:
             attention_mask=text_inputs['attention_mask'] if texts is not None else None,
             labels=text_inputs['input_ids'] if texts is not None and return_labels else None
         )
-
-
-def modified_build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
-    if self.add_bos_token:
-        bos_token_ids = [self.bos_token_id]
-    else:
-        bos_token_ids = []
-
-    if self.add_eos_token:
-        eos_token_ids = [self.eos_token_id]
-    else:
-        eos_token_ids = []
-
-    output = bos_token_ids + token_ids_0 + eos_token_ids
-
-    if token_ids_1 is None:
-        return output
-
-    return output + bos_token_ids + token_ids_1
