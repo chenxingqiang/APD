@@ -102,7 +102,7 @@ class APDModel(nn.Module):
             config.max_position_embeddings, config.hidden_size)
 
         # 在APDModel的__init__中添加:
-        self.multi_scale_extractor = MultiScaleFeatureExtractor(config)
+        self.multi_scale_features = MultiScaleFeatureExtractor(config)
 
         # 在APDModel的__init__中添加:
         self.feature_fusion = DynamicFeatureFusion(config)
@@ -142,7 +142,7 @@ class APDModel(nn.Module):
             past_length = past_key_values[0][0].size(-2)
 
         # 多尺度特征提取
-        multi_scale_features = self.multi_scale_extractor(pixel_values)
+        multi_scale_features = self.multi_scale_features(pixel_values)
 
         # 动态特征融合
         fused_features = self.feature_fusion(multi_scale_features)
@@ -252,7 +252,7 @@ class APDLMHeadModel(nn.Module):
             position_ids=position_ids,
             attention_mask=attention_mask,
             use_cache=use_cache,
-            multi_scale_features=self.transformer.multi_scale_extractor(
+            multi_scale_features=self.transformer.multi_scale_features(
                 pixel_values)  # 添加这一行
         )
 
