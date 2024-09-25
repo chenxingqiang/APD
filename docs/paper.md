@@ -32,7 +32,6 @@ The dynamic feature fusion is particularly important for improving recognition a
 
 [Image description: A visual representation of the dynamic feature fusion process, showing how features from different scales are weighted and combined. The image should include arrows of varying thicknesses to represent the adaptive importance of each feature scale.]
 
-
 ### 1.4 Innovations and Contributions
 
 The **Adaptive Perceptual Decoder (APD)** introduces several key innovations that distinguish it from existing approaches:
@@ -64,7 +63,6 @@ In encoder-decoder architectures, the encoder plays a crucial role in transformi
 The decoder, traditionally using Recurrent Neural Networks (RNNs) or more recently Transformer-based models, is responsible for generating sequences of characters or words from the encoded visual representation. RNNs, particularly Long Short-Term Memory (LSTM) networks, have been widely employed in early OCR systems due to their ability to handle sequential data [2]. However, RNNs have shown limitations in capturing long-range dependencies, and they struggle with text of varying lengths or in scenarios where the spatial arrangement of text is irregular [7].
 
 [Image description: A flowchart showing the traditional encoder-decoder architecture for OCR, with an emphasis on the limitations of fixed receptive fields in the encoder and the sequential processing in the decoder.]
-
 
 ### 2.2 Shift Toward Decoder-Centric Architectures
 
@@ -99,8 +97,6 @@ In addition, we introduce a **dynamic feature fusion** mechanism that uses adapt
 This combination of multi-scale perception and dynamic feature fusion significantly improves the model's accuracy and robustness, particularly when dealing with complex and irregularly shaped text [4].
 
 [Image description: A flowchart illustrating the process of multi-scale perception and dynamic feature fusion. The diagram should show multiple parallel paths for different scales of feature extraction, converging into a fusion module that dynamically weights and combines these features.]
-
-
 
 ## 3. Methods
 
@@ -153,7 +149,6 @@ $
 The attention mechanism ensures that feature maps that contribute more to the task are assigned higher weights, thereby emphasizing the most relevant features. This dynamic fusion strategy enables the model to adaptively combine information from different scales, making it robust to variations in text size, shape, and scene complexity [1].
 
 [Image description: A diagram illustrating the dynamic feature fusion process. Show multiple feature maps being combined, with attention weights visually represented (e.g., by varying arrow thicknesses) to indicate the adaptive importance of each feature map.]
-
 
 ## 4. Ablation Study
 
@@ -219,8 +214,6 @@ In **Dataset 1 (Handwritten Text)**, the single-scale model performed marginally
 
 The results from Baseline 1 underscore the importance of multi-scale perception in OCR tasks. By limiting the model to a single receptive field, we effectively reduced its capacity to handle text of different sizes and shapes, leading to a significant drop in performance [5].
 
-
-
 #### 4.3.2 Baseline 2: Fixed Feature Fusion
 
 In **Baseline 2**, we evaluated the model's performance without the dynamic feature fusion mechanism. While the multi-scale perception module was retained, the fusion of features from different scales was performed using fixed weights, meaning that each feature map contributed equally to the final output regardless of its relevance to the input image.
@@ -256,7 +249,6 @@ The results of the ablation study clearly demonstrate the contributions of both 
 In conclusion, the combination of multi-scale perception and dynamic feature fusion is essential for achieving state-of-the-art performance in OCR tasks. The complete APD model consistently outperforms baseline models across all datasets, demonstrating its effectiveness in handling complex and diverse text recognition challenges.
 
 [Image description: A summary infographic that visually represents the key findings of the ablation study. Include icons or small illustrations for multi-scale perception and dynamic feature fusion, along with arrows or other visual elements showing their impact on model performance.]
-
 
 ## 5. Conclusion
 
@@ -297,8 +289,6 @@ While the APD model has demonstrated superior performance across a variety of te
 In conclusion, the **Adaptive Perceptual Decoder (APD)** represents a significant advancement in the field of OCR, offering a powerful and flexible approach to text recognition in complex and dynamic environments. Through the combination of multi-scale perception and dynamic feature fusion, the APD model achieves state-of-the-art performance, demonstrating its potential for a wide range of OCR applications. As we continue to refine and extend the capabilities of this model, we anticipate that it will play a key role in advancing the future of text recognition technology, enabling more accurate and robust text extraction across diverse real-world scenarios.
 
 [Image description: A final infographic summarizing the key contributions, performance improvements, and future directions of the APD model. Use icons, charts, and visual elements to make the information easily digestible and visually appealing.]
-
-
 
 ## References
 
@@ -365,8 +355,6 @@ In conclusion, the **Adaptive Perceptual Decoder (APD)** represents a significan
 31. Zhu, Y., et al. (2019). What is wrong with scene text recognition model comparisons? Dataset and model analysis. International Journal of Computer Vision, 127(11), 1654-1668.
 
 32. Wang, T., et al. (2020). Decoupled attention network for text recognition. Proceedings of the AAAI Conference on Artificial Intelligence, 34(07), 12216-12224.
-
-
 
 ## Acknowledgments
 
