@@ -2,6 +2,7 @@
 
 
 
+import pickle
 import os
 import sys
 import glob
@@ -14,6 +15,7 @@ from functools import partial
 
 import torch
 from torch.utils.data import Dataset, DataLoader
+from transformers.models.gpt2.modeling_gpt2 import GPT2Config
 import tqdm
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -85,7 +87,38 @@ class IAMDataset(Dataset):
         }
 
 
+def save_dataset(dataset_path: Path, train_words: List[Word], validation_words: List[Word], test_words: List[Word]):
+    data = {
+        'train_words': train_words,
+        'validation_words': validation_words,
+        'test_words': test_words
+    }
+    with open(dataset_path / 'processed_dataset.pkl', 'wb') as f:
+        pickle.dump(data, f)
+    print(f"Dataset saved to {dataset_path / 'processed_dataset.pkl'}")
+
+
 def load_dataset(dataset_path: Path) -> Tuple[List[Word], List[Word], List[Word]]:
+    processed_file = dataset_path / 'processed_dataset.pkl'
+    if os.path.exists(processed_file):
+        print(f"Loading processed dataset from {processed_file}")
+        with open(processed_file, 'rb') as f:
+            data = pickle.load(f)
+        train_words = data['train_words']
+        validation_words = data['validation_words']
+        test_words = data['test_words']
+        print(
+            f'Loaded dataset - Train size: {len(train_words)}; Validation size: {len(validation_words)}; Test size: {len(test_words)}')
+    else:
+        print("Processed dataset not found. Generating new dataset.")
+        train_words, validation_words, test_words = generate_dataset(
+            dataset_path)
+        save_dataset(dataset_path, train_words, validation_words, test_words)
+
+    return train_words, validation_words, test_words
+
+
+def generate_dataset(dataset_path: Path) -> Tuple[List[Word], List[Word], List[Word]]:
     xml_files = sorted(glob.glob(str(dataset_path / 'xml' / '*.xml')))
     word_image_files = sorted(
         glob.glob(str(dataset_path / 'words' / '**' / '*.png'), recursive=True))
@@ -116,9 +149,8 @@ def load_dataset(dataset_path: Path) -> Tuple[List[Word], List[Word], List[Word]
     test_words = [word for word in words if word.id in test_ids]
 
     print(
-        f'Train size: {len(train_words)}; Validation size: {len(validation_words)}; Test size: {len(test_words)}')
+        f'Generated dataset - Train size: {len(train_words)}; Validation size: {len(validation_words)}; Test size: {len(test_words)}')
     return train_words, validation_words, test_words
-
 
 def create_dataloaders(train_words: List[Word], validation_words: List[Word], test_words: List[Word], config: APDConfig, batch_size: int = 32) -> Tuple[DataLoader, DataLoader, DataLoader]:
     train_data = IAMDataset(words=train_words, config=config)
@@ -210,11 +242,17 @@ def test_model(model: torch.nn.Module, test_words: List[Word], processor: APDPro
 
 def main():
     dataset_path = Path('./datasets/iam_words')
-    config = APDConfig()
+    config = APDConfig(gpt2_hf_model='openai-community/gpt2')
 
     train_words, validation_words, test_words = load_dataset(dataset_path)
     train_dataloader, validation_dataloader, test_dataloader = create_dataloaders(
          train_words, validation_words, test_words, config)
+
+    print("Pre-trained GPT2 config:",
+         GPT2Config.from_pretrained('openai-community/gpt2'))
+
+
+    print("Custom model config:", config.gpt2_config)
 
     model = APDLMHeadModel(config)
 

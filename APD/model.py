@@ -1,3 +1,4 @@
+from transformers.pytorch_utils import Conv1D
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -9,7 +10,7 @@ from data import APDLMHeadModelOutput, APDModelOutput, APDProcessorOutput
 
 from transformers.models.vit.modeling_vit import ViTPatchEmbeddings
 from transformers.generation.logits_process import LogitsProcessorList
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block, GPT2Model, GPT2Attention
+from transformers.models.gpt2.modeling_gpt2 import GPT2Block, GPT2Model, GPT2Attention, GPT2Config
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask_for_sdpa
 from transformers.generation.beam_search import BeamScorer, BeamSearchScorer
@@ -22,44 +23,266 @@ from transformers.generation.stopping_criteria import (
 )
 
 
-class EnhancedGPT2Block(GPT2Block):
-    def __init__(self, config, layer_idx=None):
-        super().__init__(config, layer_idx)
-        self.crossattention = GPT2Attention(config)
+import torch.nn as nn
+import torch
 
-    def forward(self, hidden_states, layer_past=None, attention_mask=None,
-                multi_scale_features=None, use_cache=False):
+
+import math
+import torch
+import torch.nn as nn
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention as OriginalGPT2Attention
+
+
+class GPT2MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        inner_dim = config.n_inner if config.n_inner is not None else 4 * config.hidden_size
+        self.c_fc = Conv1D(inner_dim, config.hidden_size)
+        self.c_proj = Conv1D(config.hidden_size, inner_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(config.resid_pdrop)
+
+    def forward(self, x):
+        h = self.act(self.c_fc(x))
+        h = self.c_proj(h)
+        return self.dropout(h)
+
+
+class CustomGPT2Attention(nn.Module):
+    def __init__(self, config, is_cross_attention=False):
+        super().__init__()
+        self.is_cross_attention = is_cross_attention
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+
+        if self.head_dim * self.num_heads != self.embed_dim:
+            raise ValueError(
+                f"Embedding dimension ({self.embed_dim}) must be divisible by number of heads ({self.num_heads})."
+            )
+
+        self.scale_attn_weights = True
+
+        # Initialize c_attn as Conv1D
+        if is_cross_attention:
+            self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
+            self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
+        else:
+            self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+
+        self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
+        self.attn_dropout = nn.Dropout(config.attn_pdrop)
+        self.resid_dropout = nn.Dropout(config.resid_pdrop)
+
+    def forward(
+        self,
+        hidden_states,
+        layer_past=None,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        use_cache=False,
+        output_attentions=False,
+    ):
+        # Debug print
+        print(f"Input hidden_states shape: {hidden_states.shape}")
+
+        if self.is_cross_attention:
+            if encoder_hidden_states is None:
+                raise ValueError(
+                    "encoder_hidden_states must be provided for cross-attention.")
+            query = self.q_attn(hidden_states)
+            key_value = self.c_attn(encoder_hidden_states)
+            key, value = key_value.split(self.embed_dim, dim=2)
+        else:
+            qkv = self.c_attn(hidden_states)
+            print(f"QKV shape after c_attn: {qkv.shape}")  # Debug print
+            query, key, value = qkv.split(self.embed_dim, dim=2)
+
+        # Debug print
+        print(
+            f"Query shape: {query.shape}, Key shape: {key.shape}, Value shape: {value.shape}")
+
+        query = self._split_heads(query, self.num_heads, self.head_dim)
+        key = self._split_heads(key, self.num_heads, self.head_dim)
+        value = self._split_heads(value, self.num_heads, self.head_dim)
+
+        # Debug print
+        print(
+            f"After split_heads - Query: {query.shape}, Key: {key.shape}, Value: {value.shape}")
+
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            key = torch.cat((past_key, key), dim=-2)
+            value = torch.cat((past_value, value), dim=-2)
+
+        if use_cache:
+            present = (key, value)
+        else:
+            present = None
+
+        attn_output, attn_weights = self._attn(
+            query, key, value, attention_mask, head_mask)
+
+        # Debug print
+        print(f"After attention - attn_output shape: {attn_output.shape}")
+
+        attn_output = self._merge_heads(
+            attn_output, self.num_heads, self.head_dim)
+        # Debug print
+        print(f"After merge_heads - attn_output shape: {attn_output.shape}")
+
+        attn_output = self.c_proj(attn_output)
+        attn_output = self.resid_dropout(attn_output)
+
+        print(f"Final attn_output shape: {attn_output.shape}")  # Debug print
+
+        outputs = (attn_output, present)
+        if output_attentions:
+            outputs += (attn_weights,)
+
+        return outputs
+
+    @staticmethod
+    def _split_heads(tensor, num_heads, attn_head_size):
+        new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
+        tensor = tensor.view(new_shape)
+        return tensor.permute(0, 2, 1, 3)
+
+    @staticmethod
+    def _merge_heads(tensor, num_heads, attn_head_size):
+        tensor = tensor.permute(0, 2, 1, 3).contiguous()
+        new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
+        return tensor.view(new_shape)
+
+    def _attn(self, query, key, value, attention_mask=None, head_mask=None):
+        attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+        if self.scale_attn_weights:
+            attn_weights = attn_weights / math.sqrt(self.head_dim)
+
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        if head_mask is not None:
+            attn_weights = attn_weights * head_mask
+
+        attn_output = torch.matmul(attn_weights, value)
+        return attn_output, attn_weights
+
+class EnhancedGPT2Block(nn.Module):
+    def __init__(self, config, layer_idx=None):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_epsilon)
+        self.ln_2 = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_epsilon)
+        self.attn = CustomGPT2Attention(config)
+        self.mlp = GPT2MLP(config)
+
+        if config.add_cross_attention:
+            self.ln_cross_attn = nn.LayerNorm(
+                config.hidden_size, eps=config.layer_norm_epsilon)
+            self.crossattention = CustomGPT2Attention(
+                config, is_cross_attention=True)
+
+    def forward(
+        self,
+        hidden_states,
+        layer_past=None,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        use_cache=False,
+        output_attentions=False,
+    ):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
         attn_outputs = self.attn(
             hidden_states,
             layer_past=layer_past,
             attention_mask=attention_mask,
+            head_mask=head_mask,
             use_cache=use_cache,
+            output_attentions=output_attentions,
         )
-        attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
-        outputs = attn_outputs[1:]
+        attn_output = attn_outputs[0]
+        outputs = attn_outputs[1:]  # present, (attentions)
 
-        # 添加多尺度特征的交叉注意力
-        if multi_scale_features is not None:
+        hidden_states = residual + attn_output
+
+        if encoder_hidden_states is not None:
+            residual = hidden_states
+            hidden_states = self.ln_cross_attn(hidden_states)
             cross_attn_outputs = self.crossattention(
-                hidden_states,
-                multi_scale_features,
-                multi_scale_features,
-                attention_mask=None,
-                use_cache=False
+                hidden_states=hidden_states,
+                attention_mask=encoder_attention_mask,
+                head_mask=head_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
             )
-            attn_output = attn_output + cross_attn_outputs[0]
+            attn_output = cross_attn_outputs[0]
+            hidden_states = residual + attn_output
+            # add cross attentions if we output attention weights
+            outputs = outputs + cross_attn_outputs[2:]
 
-        hidden_states = self.mlp(self.ln_2(attn_output))
-        hidden_states = residual + hidden_states + attn_output
+        residual = hidden_states
+        hidden_states = self.ln_2(hidden_states)
+        feed_forward_hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + feed_forward_hidden_states
 
         if use_cache:
             outputs = (hidden_states,) + outputs
         else:
             outputs = (hidden_states,) + outputs[1:]
 
+        # hidden_states, present, (attentions, cross_attentions)
         return outputs
+
+
+class DynamicFeatureFusion(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(config.hidden_size, num_heads=8)
+        self.linear = nn.Linear(config.hidden_size * 3, 3)  # 输出改为3通道
+
+    def forward(self, features):
+        # 假设 features 的形状是 [batch_size, 3 * hidden_size, height, width]
+        batch_size, channels, height, width = features.shape
+        hidden_size = channels // 3
+
+        # 将特征重塑为 [batch_size, 3, hidden_size, height, width]
+        features = features.view(batch_size, 3, hidden_size, height, width)
+
+        # 将特征重塑为 [3, batch_size * height * width, hidden_size]
+        features_3d = features.permute(
+            1, 0, 3, 4, 2).reshape(3, -1, hidden_size)
+
+        # 应用自注意力
+        fused_features, _ = self.attention(
+            features_3d, features_3d, features_3d)
+
+        # 将融合后的特征重塑回 [batch_size, 3 * hidden_size, height, width]
+        fused_features = fused_features.reshape(
+            3, batch_size, height, width, hidden_size)
+        fused_features = fused_features.permute(
+            1, 0, 4, 2, 3).reshape(batch_size, -1, height, width)
+
+        # 使用线性层将通道数减少到3
+        # [batch_size, height, width, 3 * hidden_size]
+        fused_features = fused_features.permute(0, 2, 3, 1)
+        # [batch_size, height, width, 3]
+        fused_features = self.linear(fused_features)
+        fused_features = fused_features.permute(
+            0, 3, 1, 2)  # [batch_size, 3, height, width]
+
+        return fused_features
 
 
 class MultiScaleFeatureExtractor(nn.Module):
@@ -81,19 +304,10 @@ class MultiScaleFeatureExtractor(nn.Module):
                           for f in features], dim=1)
 
 
-class DynamicFeatureFusion(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(config.hidden_size, num_heads=8)
-
-    def forward(self, features):
-        fused_features, _ = self.attention(features, features, features)
-        return fused_features
-
-
 class APDModel(nn.Module):
     def __init__(self, config: APDConfig):
         super().__init__()
+        self.embed_dim = config.hidden_size  # Initialize embed_dim here
         # embeddings
         self.patch_embeddings = ViTPatchEmbeddings(config)
         self.token_embedding = nn.Embedding(
@@ -101,18 +315,42 @@ class APDModel(nn.Module):
         self.positional_embedding = nn.Embedding(
             config.max_position_embeddings, config.hidden_size)
 
-        # 在APDModel的__init__中添加:
-        self.multi_scale_features = MultiScaleFeatureExtractor(config)
+        self.use_dynamic_fusion = config.use_dynamic_fusion
+        self.cross_attention_layers = config.cross_attention_layers
+        self.use_multi_scale_features = config.use_multi_scale_features
 
-        # 在APDModel的__init__中添加:
-        self.feature_fusion = DynamicFeatureFusion(config)
+        if self.use_multi_scale_features:
+            self.multi_scale_feature_extractor = MultiScaleFeatureExtractor(
+                config)
 
-        # 在APDModel的__init__中替换原有的GPT2Block:
-        self.hidden_layers = nn.ModuleList([EnhancedGPT2Block(
-            config, layer_idx=i) for i in range(config.num_hidden_layers)])
+        if self.use_dynamic_fusion:
+            self.feature_fusion = DynamicFeatureFusion(config)
 
-        self.hidden_layers = nn.ModuleList(
-            [GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers)])
+        self.gpt2_config = GPT2Config(
+            vocab_size=config.vocab_size,
+            n_positions=config.max_position_embeddings,
+            n_embd=config.hidden_size,
+            n_layer=config.num_hidden_layers,
+            n_head=config.num_attention_heads,
+            n_inner=config.n_inner if hasattr(config, 'n_inner') else None,
+            activation_function=config.activation_function if hasattr(
+                config, 'activation_function') else "gelu_new",
+            resid_pdrop=config.resid_pdrop,
+            embd_pdrop=config.embd_pdrop,
+            attn_pdrop=config.attn_pdrop,
+            layer_norm_epsilon=config.layer_norm_epsilon,
+            initializer_range=config.initializer_range if hasattr(
+                config, 'initializer_range') else 0.02,
+            scale_attn_weights=config.scale_attn_weights if hasattr(
+                config, 'scale_attn_weights') else True,
+            use_cache=True
+        )
+
+        self.hidden_layers = nn.ModuleList([
+            EnhancedGPT2Block(config.gpt2_config, layer_idx=i)
+            for i in range(config.num_hidden_layers)
+        ])
+
         self.dropout = nn.Dropout(config.attn_pdrop)
         self.layer_norm = nn.LayerNorm(
             config.hidden_size, eps=config.layer_norm_epsilon)
@@ -131,101 +369,159 @@ class APDModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
     ) -> APDModelOutput:
-        device = input_ids.device if input_ids is not None else input_ids.device
+        device = input_ids.device if input_ids is not None else pixel_values.device
         input_ids = input_ids.view(-1, input_ids.shape[-1])
 
-        # past key values
-        if past_key_values is None:
-            past_length = 0
-            past_key_values = tuple([None] * len(self.hidden_layers))
-        else:
+        # Determine past_length
+        past_length = 0
+        if past_key_values is not None:
             past_length = past_key_values[0][0].size(-2)
 
-        # 多尺度特征提取
-        multi_scale_features = self.multi_scale_features(pixel_values)
+        if self.use_multi_scale_features:
+            multi_scale_features = self.multi_scale_feature_extractor(
+                pixel_values)
+            if self.use_dynamic_fusion:
+                fused_features = self.feature_fusion(multi_scale_features)
+            else:
+                fused_features = multi_scale_features.view(
+                    multi_scale_features.shape[0], 3, -1,
+                    multi_scale_features.shape[2], multi_scale_features.shape[3]
+                ).mean(dim=2)
+            patch_embeddings = self.patch_embeddings(fused_features)
+        else:
+            multi_scale_features = None
+            patch_embeddings = self.patch_embeddings(pixel_values)
 
-        # 动态特征融合
-        fused_features = self.feature_fusion(multi_scale_features)
-
-        # 将融合后的特征与token嵌入结合
-        patch_embeddings = self.patch_embeddings(fused_features)
         token_embeddings = self.token_embedding(input_ids)
 
         if patch_embeddings is not None:
-            patch_and_token_embeddings = torch.concat(
-                [patch_embeddings, token_embeddings], dim=-2)
+            patch_and_token_embeddings = torch.cat(
+                [patch_embeddings, token_embeddings], dim=1)
         else:
             patch_and_token_embeddings = token_embeddings
-        input_shape = patch_and_token_embeddings.shape
+        input_shape = patch_and_token_embeddings.size()
 
-        if position_ids is None or past_length == 0:
+        if position_ids is None:
             position_ids = torch.arange(
                 past_length, input_shape[1] + past_length, dtype=torch.long, device=device)
-            position_ids = position_ids.unsqueeze(0)
-        else:
-            position_ids = torch.ones_like(
-                position_ids, device=position_ids.device) * past_length
+            position_ids = position_ids.unsqueeze(0).expand(input_shape[0], -1)
+
         position_embeddings = self.positional_embedding(position_ids)
 
         hidden_states = patch_and_token_embeddings + position_embeddings
         hidden_states = self.dropout(hidden_states)
 
-        # attention mask
+        # Prepare attention mask
         if attention_mask is not None:
-            attention_mask = torch.concat(
+            # Ensure the attention mask is expanded to the right shape
+            attention_mask = torch.cat(
                 [
                     torch.ones(
-                        attention_mask.shape[0],
-                        patch_embeddings.shape[-2] if patch_embeddings is not None else past_length,
+                        (attention_mask.shape[0], patch_embeddings.shape[1]
+                         if patch_embeddings is not None else past_length),
                         dtype=attention_mask.dtype,
                         device=attention_mask.device
                     ),
                     attention_mask
-                ], dim=-1
+                ],
+                dim=-1
             )
+
             if self._attn_implementation == "flash_attention_2":
                 attention_mask = attention_mask if 0 in attention_mask else None
             else:
                 attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
                     attention_mask=attention_mask,
-                    input_shape=(input_shape[0], input_shape[-2]),
+                    input_shape=input_shape[:2],
                     inputs_embeds=patch_and_token_embeddings,
                     past_key_values_length=past_length,
                 )
 
         presents = () if use_cache else None
-        for hidden_layer, layer_past in zip(self.hidden_layers, past_key_values):
-            outputs = hidden_layer(
+
+        for i, (hidden_layer, layer_past) in enumerate(zip(self.hidden_layers, past_key_values or [None] * len(self.hidden_layers))):
+            if isinstance(hidden_layer, EnhancedGPT2Block):
+                encoder_hidden_states = multi_scale_features if i in self.cross_attention_layers else None
+                layer_outputs = hidden_layer(
+                    hidden_states,
+                    layer_past=layer_past,
+                    attention_mask=attention_mask,
+                    use_cache=use_cache,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=None,  # Provide if necessary
+                )
+        else:
+            layer_outputs = hidden_layer(
                 hidden_states,
                 layer_past=layer_past,
                 attention_mask=attention_mask,
-                use_cache=use_cache
+                use_cache=use_cache,
             )
-            hidden_states = outputs[0]
-            if use_cache is True:
-                presents = presents + (outputs[1],)
+        hidden_states = layer_outputs[0]
+        if use_cache:
+            presents = presents + (layer_outputs[1],)
 
         hidden_states = self.layer_norm(hidden_states)
 
         return APDModelOutput(hidden_states=hidden_states, past_key_values=presents)
 
     def initialise_weights(self, config: APDConfig) -> None:
-        # load pre-trained GPT-2
-        pretrained_gpt2 = GPT2Model.from_pretrained(config.gpt2_hf_model)
+        pretrained_gpt2 = GPT2Model.from_pretrained(
+            config.gpt2_hf_model,
+            config=self.gpt2_config,
+            ignore_mismatched_sizes=True
+        )
 
-        # copy hidden layer weights
-        for hidden_layer, pretrained_hidden_layer in zip(self.hidden_layers, pretrained_gpt2.h):
-            hidden_layer.load_state_dict(pretrained_hidden_layer.state_dict())
+        # Load positional embeddings
+        self.positional_embedding.weight.data[:config.max_position_embeddings,
+                                         :] = pretrained_gpt2.wpe.weight.data[:config.max_position_embeddings, :]
 
-        # token embeddings
+
+        for i, (hidden_layer, pretrained_hidden_layer) in enumerate(zip(self.hidden_layers, pretrained_gpt2.h)):
+            hidden_layer.ln_1.load_state_dict(
+                pretrained_hidden_layer.ln_1.state_dict())
+            hidden_layer.ln_2.load_state_dict(
+                pretrained_hidden_layer.ln_2.state_dict())
+            hidden_layer.mlp.load_state_dict(
+                pretrained_hidden_layer.mlp.state_dict())
+
+            # Load attention weights
+            hidden_layer.attn.c_attn.weight.data = pretrained_hidden_layer.attn.c_attn.weight.data.clone()
+            hidden_layer.attn.c_attn.bias.data = pretrained_hidden_layer.attn.c_attn.bias.data.clone()
+            hidden_layer.attn.c_proj.load_state_dict(
+                pretrained_hidden_layer.attn.c_proj.state_dict())
+
+            if hasattr(hidden_layer, 'crossattention'):
+                # Initialize cross-attention weights appropriately
+                hidden_layer.crossattention.c_attn.weight.data = pretrained_hidden_layer.attn.c_attn.weight.data.clone()
+                hidden_layer.crossattention.c_attn.bias.data = pretrained_hidden_layer.attn.c_attn.bias.data.clone()
+                hidden_layer.crossattention.c_proj.load_state_dict(
+                    pretrained_hidden_layer.attn.c_proj.state_dict())
+                hidden_layer.ln_cross_attn.load_state_dict(
+                    pretrained_hidden_layer.ln_1.state_dict())
+
         self.token_embedding.load_state_dict(pretrained_gpt2.wte.state_dict())
+
+       # Initialize other new modules
+        if self.use_multi_scale_features:
+            self.multi_scale_feature_extractor.apply(self._init_weights)
+        if self.use_dynamic_fusion:
+            self.feature_fusion.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding, nn.Conv2d)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
 
 
 class APDLMHeadModel(nn.Module):
     def __init__(self, config: APDConfig):
         super().__init__()
         self.config = config
-
         self.transformer = APDModel(config)
         self.language_model_head = nn.Linear(
             config.hidden_size, config.vocab_size, bias=False)
@@ -252,8 +548,6 @@ class APDLMHeadModel(nn.Module):
             position_ids=position_ids,
             attention_mask=attention_mask,
             use_cache=use_cache,
-            multi_scale_features=self.transformer.multi_scale_features(
-                pixel_values)  # 添加这一行
         )
 
         logits = self.language_model_head(transformer_output.hidden_states)
@@ -619,24 +913,14 @@ class APDLMHeadModel(nn.Module):
         input_ids: torch.Tensor, past_key_values=None, **kwargs
     ) -> Dict[str, Any]:
         # Omit tokens covered by past_key_values
-
-        inputs = super().prepare_inputs_for_generation(
-            input_ids, past_key_values, **kwargs)
-        if past_key_values is None:
-            # 只在第一步计算多尺度特征
-            inputs['multi_scale_features'] = kwargs['multi_scale_features']
-        return inputs
-
         if past_key_values:
             past_length = past_key_values[0][0].shape[2]
-
             # Some generation methods already pass only the last input ID
             if input_ids.shape[1] > past_length:
                 remove_prefix_length = past_length
             else:
                 # Default to old behavior: keep only final ID
                 remove_prefix_length = input_ids.shape[1] - 1
-
             input_ids = input_ids[:, remove_prefix_length:]
 
         attention_mask = kwargs.get("attention_mask", None)
@@ -651,17 +935,14 @@ class APDLMHeadModel(nn.Module):
         else:
             position_ids = None
 
-        model_inputs = {
-            'input_ids': input_ids,
+        return {
+            "input_ids": input_ids,
             "past_key_values": past_key_values,
-            'pixel_values': kwargs['pixel_values'],
-            'use_cache': kwargs.get("use_cache"),
-            'labels': kwargs.get("labels"),
-            'attention_mask': attention_mask,
-            'position_ids': position_ids
+            "pixel_values": kwargs.get("pixel_values"),
+            "use_cache": kwargs.get("use_cache"),
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
         }
-
-        return model_inputs
 
     @staticmethod
     def _get_initial_cache_position(input_ids, model_kwargs):
