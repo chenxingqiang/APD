@@ -1,12 +1,13 @@
+import collections.abc
 from transformers.pytorch_utils import Conv1D
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 
 from typing import Optional, Tuple, Dict, Any
-from .config import APDConfig
-from processor import APDProcessor
-from data import APDLMHeadModelOutput, APDModelOutput, APDProcessorOutput
+from APD.config import APDConfig
+from APD.processor import APDProcessor
+from APD.data import APDLMHeadModelOutput, APDModelOutput, APDProcessorOutput
 
 from transformers.models.vit.modeling_vit import ViTPatchEmbeddings
 from transformers.generation.logits_process import LogitsProcessorList
@@ -22,15 +23,7 @@ from transformers.generation.stopping_criteria import (
     StopStringCriteria,
 )
 
-
-import torch.nn as nn
-import torch
-
-
 import math
-import torch
-import torch.nn as nn
-from transformers.models.gpt2.modeling_gpt2 import GPT2Attention as OriginalGPT2Attention
 
 
 class GPT2MLP(nn.Module):
@@ -65,28 +58,32 @@ class CustomGPT2Attention(nn.Module):
 
         # Initialize c_attn as Conv1D
         if is_cross_attention:
-            self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
+            # self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
+            self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
             self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
         else:
             self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+
+        self.c_conv = nn.Conv1d(
+            in_channels=2304, out_channels=1536, kernel_size=1, stride=1, padding=0)
 
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
     def forward(
-        self,
-        hidden_states,
-        layer_past=None,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        use_cache=False,
-        output_attentions=False,
+            self,
+            hidden_states,
+            layer_past=None,
+            attention_mask=None,
+            head_mask=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            use_cache=False,
+            output_attentions=False,
     ):
         # Debug print
-        print(f"Input hidden_states shape: {hidden_states.shape}")
+        # print(f"Input hidden_states shape: {hidden_states.shape}")
 
         if self.is_cross_attention:
             if encoder_hidden_states is None:
@@ -94,23 +91,26 @@ class CustomGPT2Attention(nn.Module):
                     "encoder_hidden_states must be provided for cross-attention.")
             query = self.q_attn(hidden_states)
             key_value = self.c_attn(encoder_hidden_states)
+            key_value = key_value.permute(0, 2, 1)
+            key_value = self.c_conv(key_value)
+            key_value = key_value.permute(0, 2, 1)
             key, value = key_value.split(self.embed_dim, dim=2)
         else:
             qkv = self.c_attn(hidden_states)
-            print(f"QKV shape after c_attn: {qkv.shape}")  # Debug print
+            # print(f"QKV shape after c_attn: {qkv.shape}")  # Debug print
             query, key, value = qkv.split(self.embed_dim, dim=2)
 
         # Debug print
-        print(
-            f"Query shape: {query.shape}, Key shape: {key.shape}, Value shape: {value.shape}")
+        # print(
+        #     f"Query shape: {query.shape}, Key shape: {key.shape}, Value shape: {value.shape}")
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
         value = self._split_heads(value, self.num_heads, self.head_dim)
 
         # Debug print
-        print(
-            f"After split_heads - Query: {query.shape}, Key: {key.shape}, Value: {value.shape}")
+        # print(
+        #     f"After split_heads - Query: {query.shape}, Key: {key.shape}, Value: {value.shape}")
 
         if layer_past is not None:
             past_key, past_value = layer_past
@@ -125,18 +125,18 @@ class CustomGPT2Attention(nn.Module):
         attn_output, attn_weights = self._attn(
             query, key, value, attention_mask, head_mask)
 
-        # Debug print
-        print(f"After attention - attn_output shape: {attn_output.shape}")
+        # # Debug print
+        # print(f"After attention - attn_output shape: {attn_output.shape}")
 
         attn_output = self._merge_heads(
             attn_output, self.num_heads, self.head_dim)
-        # Debug print
-        print(f"After merge_heads - attn_output shape: {attn_output.shape}")
+        # # Debug print
+        # print(f"After merge_heads - attn_output shape: {attn_output.shape}")
 
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
-        print(f"Final attn_output shape: {attn_output.shape}")  # Debug print
+        # print(f"Final attn_output shape: {attn_output.shape}")  # Debug print
 
         outputs = (attn_output, present)
         if output_attentions:
@@ -174,6 +174,7 @@ class CustomGPT2Attention(nn.Module):
         attn_output = torch.matmul(attn_weights, value)
         return attn_output, attn_weights
 
+
 class EnhancedGPT2Block(nn.Module):
     def __init__(self, config, layer_idx=None):
         super().__init__()
@@ -191,15 +192,15 @@ class EnhancedGPT2Block(nn.Module):
                 config, is_cross_attention=True)
 
     def forward(
-        self,
-        hidden_states,
-        layer_past=None,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        use_cache=False,
-        output_attentions=False,
+            self,
+            hidden_states,
+            layer_past=None,
+            attention_mask=None,
+            head_mask=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            use_cache=False,
+            output_attentions=False,
     ):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
@@ -253,6 +254,12 @@ class DynamicFeatureFusion(nn.Module):
         self.linear = nn.Linear(config.hidden_size * 3, 3)  # 输出改为3通道
 
     def forward(self, features):
+        """
+        动态特征融合
+        :param features: 经过多尺度特征提取的图片序列 (8, 2304, 32, 128)
+        :return: 返回经过多头注意力机制和全连接层处理的序列 (8, 3, 32, 128)
+        """
+        # 分别提取输入图片序列的各个维度
         # 假设 features 的形状是 [batch_size, 3 * hidden_size, height, width]
         batch_size, channels, height, width = features.shape
         hidden_size = channels // 3
@@ -260,11 +267,12 @@ class DynamicFeatureFusion(nn.Module):
         # 将特征重塑为 [batch_size, 3, hidden_size, height, width]
         features = features.view(batch_size, 3, hidden_size, height, width)
 
-        # 将特征重塑为 [3, batch_size * height * width, hidden_size]
+        # 先将特征 [batch_size, 3, hidden_size, height, width] 重塑为 [3, batch_size, height, width, hidden_size]
+        # 再将特征重塑为 [3, batch_size * height * width, hidden_size]
         features_3d = features.permute(
             1, 0, 3, 4, 2).reshape(3, -1, hidden_size)
 
-        # 应用自注意力
+        # 使用多头注意力机制，融合不同尺度的特征
         fused_features, _ = self.attention(
             features_3d, features_3d, features_3d)
 
@@ -288,20 +296,84 @@ class DynamicFeatureFusion(nn.Module):
 class MultiScaleFeatureExtractor(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.scales = [0.5, 1, 2]  # 多个尺度
+        # 多个图片缩放尺度
+        self.scales = [0.5, 1, 2]
+        # 根据三种图片缩放尺度设置了三个卷积层
         self.convs = nn.ModuleList([
             nn.Conv2d(3, config.hidden_size, kernel_size=3, padding=1)
             for _ in self.scales
         ])
 
     def forward(self, x):
+        """
+        多尺度特征提取器
+        :param x: 当前 batch 的图片像素值，维度 (8, 3 ,32, 128)
+        :return: 将图片像素值经过吃个尺度的缩放加卷积，最终返回拼接后的新图片像素值 (8, 768*3, 32, 128)
+        """
         features = []
         for scale, conv in zip(self.scales, self.convs):
+            # 依照当前对应尺度缩放图片，比如尺度 0.5
+            # 原本图片像素数据维度为 (8, 3, 32, 128)
+            # 缩放 0.5 倍后维度变为 (8, 3, 16, 64)
             scaled_x = F.interpolate(
                 x, scale_factor=scale, mode='bilinear', align_corners=False)
+            # 对缩放后数据分别进行二维卷积，并存入名为 features 的列表中
+            # 0.5 倍: (8, 3, 32, 128) -> (8, 768, 16, 64)
+            # 1 倍: (8, 3, 32, 128) -> (8, 768, 32, 128)
+            # 2 倍: (8, 3, 32, 128) -> (8, 768, 64, 256)
             features.append(conv(scaled_x))
+            # 特征融合（拼接）
+            # 每个特征序列都先通过 F.interpolate 调整到原始输入尺寸
+            # 0.5 倍: (8, 3, 16, 64) -> (8, 3, 32, 128)
+            # 1 倍: (8, 3, 32, 128) -> (8, 3, 32, 128)
+            # 2 倍: (8, 3, 64, 256) -> (8, 3, 32, 128)
+            # 然后通过 torch.cat 在通道维度（dim=1）上进行拼接
+            # 最终维度为 (8, 768*3, 32, 128) -> (8, 2304, 32, 128)
         return torch.cat([F.interpolate(f, size=x.shape[2:], mode='bilinear', align_corners=False)
                           for f in features], dim=1)
+
+
+class ViTPatchEmbed1(nn.Module):
+    """
+    This class turns `pixel_values` of shape `(batch_size, num_channels, height, width)` into the initial
+    `hidden_states` (patch embeddings) of shape `(batch_size, seq_length, hidden_size)` to be consumed by a
+    Transformer.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        image_size, patch_size = config.image_size, config.patch_size
+        num_channels, hidden_size = config.num_channels_1, config.hidden_size
+
+        image_size = image_size if isinstance(
+            image_size, collections.abc.Iterable) else (image_size, image_size)
+        patch_size = patch_size if isinstance(
+            patch_size, collections.abc.Iterable) else (patch_size, patch_size)
+        num_patches = (image_size[1] // patch_size[1]) * \
+            (image_size[0] // patch_size[0])
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_channels = num_channels
+        self.num_patches = num_patches
+
+        self.projection = nn.Conv2d(
+            num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False) -> torch.Tensor:
+        batch_size, num_channels, height, width = pixel_values.shape
+        if num_channels != self.num_channels:
+            raise ValueError(
+                "Make sure that the channel dimension of the pixel values match with the one set in the configuration."
+                f" Expected {self.num_channels} but got {num_channels}."
+            )
+        if not interpolate_pos_encoding:
+            if height != self.image_size[0] or width != self.image_size[1]:
+                raise ValueError(
+                    f"Input image size ({height}*{width}) doesn't match model"
+                    f" ({self.image_size[0]}*{self.image_size[1]})."
+                )
+        embeddings = self.projection(pixel_values).flatten(2).transpose(1, 2)
+        return embeddings
 
 
 class APDModel(nn.Module):
@@ -310,6 +382,10 @@ class APDModel(nn.Module):
         self.embed_dim = config.hidden_size  # Initialize embed_dim here
         # embeddings
         self.patch_embeddings = ViTPatchEmbeddings(config)
+        self.patch_embed1 = ViTPatchEmbed1(config)
+        self.conv1d_1 = nn.Conv1d(
+            in_channels=128, out_channels=1024, kernel_size=1, stride=1, padding=0)
+
         self.token_embedding = nn.Embedding(
             config.vocab_size, config.hidden_size)
         self.positional_embedding = nn.Embedding(
@@ -361,38 +437,74 @@ class APDModel(nn.Module):
         self.initialise_weights(config)
 
     def forward(
-        self,
-        pixel_values: torch.Tensor,
-        input_ids: torch.LongTensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = False,
+            self,
+            pixel_values: torch.Tensor,
+            input_ids: torch.LongTensor,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            use_cache: Optional[bool] = False,
     ) -> APDModelOutput:
+        """
+        模型 train()==APDLMHeadModel() 前向传播过程中 transformer()==APDModel() 的前向传播过程
+        :param pixel_values: 每个batch的图像像素值序列 (train_X)
+        :param input_ids: 每个batch的图像文本序列 (train_X)
+        :param position_ids: 用于提供序列中每个token的位置信息。这对于Transformer模型是必要的，因为它们需要了解单词在序列中的位置。
+        :param past_key_values: 用于缓存机制的先前计算的键值对。在Transformer的解码过程中，这些值可以加速生成并允许并行处理。
+        :param attention_mask: 每个batch的注意力掩码序列 (train_X)，指示模型应该关注输入序列中的哪些部分的掩码，通常用于忽略填充的部分
+        :param use_cache: 一个布尔值，指示是否使用缓存机制
+        :return: 返回一个包含隐藏状态和缓存键值对的 APDModelOutput 对象
+        """
+        # 设备确定
+        # 确定输入数据所在的设备（例如CPU或GPU），以便在相同的设备上进行计算
         device = input_ids.device if input_ids is not None else pixel_values.device
+        # 重塑维度
+        # 假如 input_ids 文本序列维度高于二维，则将其重塑为二维数据
+        # -1 表示第一维自动计算，input_ids.shape[-1] 表示第二维取原本序列最后一维
+        # 假如原本维度为 (A, B, C)，则重塑后为 (A*B*C/C, C) = (A*B, C)
+        # 假如原本维度为 (A, B)，则重塑后为 (A*B/B, C) = (A, B)
         input_ids = input_ids.view(-1, input_ids.shape[-1])
 
-        # Determine past_length
+        # 在自回归解码中，模型在每一步都会生成一个新的token，并且需要将之前生成的所有token的信息传递给下一步
+        # past_key_values 用于存储这些先前生成的token的信息
+        # past_length 表示这些先前生成的token的数量
+        # 如果 past_key_values 不为空，那么 past_key_values[0][0].size(-2) 将返回这些先前token的数量
         past_length = 0
         if past_key_values is not None:
             past_length = past_key_values[0][0].size(-2)
 
+        # 处理多尺度特征
+        # 如果配置了多尺度特征提取（use_multi_scale_features），则提取图像的多尺度特征
         if self.use_multi_scale_features:
+            # pixel_values (8, 3, 32, 128) -> multi_scale_features (8, 2304, 32, 128)
             multi_scale_features = self.multi_scale_feature_extractor(
                 pixel_values)
+            # 检查是否启用了动态特征融合
             if self.use_dynamic_fusion:
+                # 动态特征融合：多头注意力机制 + 全连接层
+                # multi_scale_features (8, 2304, 32, 128) -> fused_features (8, 3, 32, 128)
                 fused_features = self.feature_fusion(multi_scale_features)
             else:
                 fused_features = multi_scale_features.view(
                     multi_scale_features.shape[0], 3, -1,
                     multi_scale_features.shape[2], multi_scale_features.shape[3]
                 ).mean(dim=2)
+            # patch 嵌入层
+            # fused_features (8, 3, 32, 128) -> patch_embeddings (8, 128, 768)
             patch_embeddings = self.patch_embeddings(fused_features)
         else:
             multi_scale_features = None
             patch_embeddings = self.patch_embeddings(pixel_values)
 
+        # 文本嵌入层
         token_embeddings = self.token_embedding(input_ids)
+
+        # multi_scale_features (8, 2304, 32, 128) -> (8, 128, 768)
+        multi_scale_features = self.patch_embed1(multi_scale_features)
+        # multi_scale_features (8, 128, 768) -> (8, 1024, 768)
+        multi_scale_features = self.conv1d_1(multi_scale_features)
+        # 将嵌入后的图片特征张量连续化
+        multi_scale_features = multi_scale_features.contiguous()
 
         if patch_embeddings is not None:
             patch_and_token_embeddings = torch.cat(
@@ -439,7 +551,8 @@ class APDModel(nn.Module):
 
         presents = () if use_cache else None
 
-        for i, (hidden_layer, layer_past) in enumerate(zip(self.hidden_layers, past_key_values or [None] * len(self.hidden_layers))):
+        for i, (hidden_layer, layer_past) in enumerate(
+                zip(self.hidden_layers, past_key_values or [None] * len(self.hidden_layers))):
             if isinstance(hidden_layer, EnhancedGPT2Block):
                 encoder_hidden_states = multi_scale_features if i in self.cross_attention_layers else None
                 layer_outputs = hidden_layer(
@@ -450,14 +563,14 @@ class APDModel(nn.Module):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,  # Provide if necessary
                 )
-        else:
-            layer_outputs = hidden_layer(
-                hidden_states,
-                layer_past=layer_past,
-                attention_mask=attention_mask,
-                use_cache=use_cache,
-            )
-        hidden_states = layer_outputs[0]
+            else:
+                layer_outputs = hidden_layer(
+                    hidden_states,
+                    layer_past=layer_past,
+                    attention_mask=attention_mask,
+                    use_cache=use_cache,
+                )
+            hidden_states = layer_outputs[0]
         if use_cache:
             presents = presents + (layer_outputs[1],)
 
@@ -474,8 +587,7 @@ class APDModel(nn.Module):
 
         # Load positional embeddings
         self.positional_embedding.weight.data[:config.max_position_embeddings,
-                                         :] = pretrained_gpt2.wpe.weight.data[:config.max_position_embeddings, :]
-
+                                              :] = pretrained_gpt2.wpe.weight.data[:config.max_position_embeddings, :]
 
         for i, (hidden_layer, pretrained_hidden_layer) in enumerate(zip(self.hidden_layers, pretrained_gpt2.h)):
             hidden_layer.ln_1.load_state_dict(
@@ -502,7 +614,7 @@ class APDModel(nn.Module):
 
         self.token_embedding.load_state_dict(pretrained_gpt2.wte.state_dict())
 
-       # Initialize other new modules
+        # Initialize other new modules
         if self.use_multi_scale_features:
             self.multi_scale_feature_extractor.apply(self._init_weights)
         if self.use_dynamic_fusion:
@@ -531,14 +643,14 @@ class APDLMHeadModel(nn.Module):
             (image_size[0] / patch_size[0]) * (image_size[1] / patch_size[1]))
 
     def forward(
-        self,
-        pixel_values: torch.Tensor,
-        input_ids: torch.LongTensor,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = False,
-        labels: Optional[torch.LongTensor] = None,
+            self,
+            pixel_values: torch.Tensor,
+            input_ids: torch.LongTensor,
+            past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            use_cache: Optional[bool] = False,
+            labels: Optional[torch.LongTensor] = None,
     ) -> APDLMHeadModelOutput:
 
         transformer_output = self.transformer(
@@ -659,12 +771,12 @@ class APDLMHeadModel(nn.Module):
         return result
 
     def _sample(
-        self,
-        input_ids: torch.Tensor,
-        logits_processor: LogitsProcessorList,
-        stopping_criteria: StoppingCriteriaList,
-        generation_config: GenerationConfig,
-        **model_kwargs,
+            self,
+            input_ids: torch.Tensor,
+            logits_processor: LogitsProcessorList,
+            stopping_criteria: StoppingCriteriaList,
+            generation_config: GenerationConfig,
+            **model_kwargs,
     ) -> torch.Tensor:
         # init values
         pad_token_id = generation_config.pad_token_id
@@ -717,13 +829,13 @@ class APDLMHeadModel(nn.Module):
         return input_ids
 
     def _beam_search(
-        self,
-        input_ids: torch.Tensor,
-        beam_scorer: BeamScorer,
-        logits_processor: LogitsProcessorList,
-        stopping_criteria: StoppingCriteriaList,
-        generation_config: GenerationConfig,
-        **model_kwargs,
+            self,
+            input_ids: torch.Tensor,
+            beam_scorer: BeamScorer,
+            logits_processor: LogitsProcessorList,
+            stopping_criteria: StoppingCriteriaList,
+            generation_config: GenerationConfig,
+            **model_kwargs,
     ) -> torch.Tensor:
         # init values
         pad_token_id = generation_config.pad_token_id
@@ -835,9 +947,9 @@ class APDLMHeadModel(nn.Module):
         return sequence_outputs["sequences"]
 
     def _get_stopping_criteria(
-        self,
-        generation_config: GenerationConfig,
-        processor: Optional[APDProcessor] = None,
+            self,
+            generation_config: GenerationConfig,
+            processor: Optional[APDProcessor] = None,
     ) -> StoppingCriteriaList:
         criteria = StoppingCriteriaList()
         if generation_config.max_length is not None:
@@ -870,7 +982,7 @@ class APDLMHeadModel(nn.Module):
     @staticmethod
     def _reorder_cache(
             past_key_values: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor
-    ) -> tuple[tuple[Tensor, ...], ...]:
+    ) -> Tuple[Tuple[Tensor, ...], ...]:
         """
         This function is used to re-order the `past_key_values` cache if [`~PreTrainedModel.beam_search`] or
         [`~PreTrainedModel.beam_sample`] is called. This is required to match `past_key_values` with the correct
@@ -884,9 +996,9 @@ class APDLMHeadModel(nn.Module):
 
     @staticmethod
     def _update_model_kwargs_for_generation(
-        outputs: APDLMHeadModelOutput,
-        model_kwargs: Dict[str, Any],
-        num_new_tokens: int = 1,
+            outputs: APDLMHeadModelOutput,
+            model_kwargs: Dict[str, Any],
+            num_new_tokens: int = 1,
     ) -> Dict[str, Any]:
 
         # update cache
@@ -900,9 +1012,9 @@ class APDLMHeadModel(nn.Module):
             )
 
         if (
-            model_kwargs.get("use_cache", True)
-            and "cache_position" in model_kwargs
-            and model_kwargs["cache_position"] is not None
+                model_kwargs.get("use_cache", True)
+                and "cache_position" in model_kwargs
+                and model_kwargs["cache_position"] is not None
         ):
             model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + num_new_tokens
 
@@ -910,7 +1022,7 @@ class APDLMHeadModel(nn.Module):
 
     @staticmethod
     def prepare_inputs_for_generation(
-        input_ids: torch.Tensor, past_key_values=None, **kwargs
+            input_ids: torch.Tensor, past_key_values=None, **kwargs
     ) -> Dict[str, Any]:
         # Omit tokens covered by past_key_values
         if past_key_values:
@@ -956,9 +1068,9 @@ class APDLMHeadModel(nn.Module):
 
     @staticmethod
     def _expand_inputs_for_generation(
-        input_ids: Optional[torch.LongTensor],
-        expand_size: int = 1,
-        **model_kwargs,
+            input_ids: Optional[torch.LongTensor],
+            expand_size: int = 1,
+            **model_kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         def _expand_dict_for_generation(dict_to_expand):
             for key in dict_to_expand:

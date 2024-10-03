@@ -17,6 +17,7 @@ class APDConfig:
         image_size: Optional[Union[Tuple[int], List[int]]] = (
             32, 128),  # (height, width)
         num_channels: Optional[int] = 3,
+        num_channels_1: Optional[int] = 2304,
         resid_pdrop: Optional[float] = 0.1,
         embd_pdrop: Optional[float] = 0.1,
         attn_pdrop: Optional[float] = 0.1,
@@ -54,6 +55,7 @@ class APDConfig:
         self.patch_size = patch_size
         self.image_size = image_size
         self.num_channels = num_channels
+        self.num_channels_1 = num_channels_1
 
         # Attention implementation (custom addition)
         self._attn_implementation = attn_implementation
