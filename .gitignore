@@ -157,4 +157,4 @@ cython_debug/
 datasets/iam_words/*
 
 
-./docs/paper.md
+./docs/paper.mdruns/
