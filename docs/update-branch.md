@@ -17,7 +17,7 @@ git status
 git fetch origin
 
 # 拉取并合并当前分支的更新
-git pull origin ocr-apd-2.0
+git pull origin dbnet++
 ```
 
 ## 切换分支
@@ -28,8 +28,8 @@ git pull origin ocr-apd-2.0
 # 列出所有分支
 git branch -a
 
-# 切换到 ocr-apd-2.0 分支
-git checkout ocr-apd-2.0
+# 切换到 dbnet++ 分支
+git checkout dbnet++
 ```
 
 ## 处理本地修改
@@ -46,7 +46,7 @@ git stash save "我的本地修改"
 2. 拉取更新
 
 ```bash
-git pull origin ocr-apd-2.0
+git pull origin dbnet++
 ```
 
 3. 恢复修改
