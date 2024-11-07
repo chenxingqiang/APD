@@ -1,7 +1,3 @@
-
-
-
-
 import pickle
 import os
 import sys
@@ -9,17 +5,30 @@ import glob
 from pathlib import Path
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import multiprocessing as mp
 from functools import partial
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers.models.gpt2.modeling_gpt2 import GPT2Config
 import tqdm
 from PIL import Image
 import matplotlib.pyplot as plt
 import numpy as np
+import cv2
+from torch.optim import AdamW
+import matplotlib.patches as patches
+from torchvision import transforms
+from typing import Optional
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from albumentations import (
+    Compose, RandomBrightnessContrast, GaussNoise, ShiftScaleRotate, Blur
+)
+
+from torch.utils.tensorboard import SummaryWriter
+from shapely.geometry import Polygon
+import torch.nn.functional as F
+
 # Ensure the project root is in the Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, project_root)
@@ -27,7 +36,8 @@ sys.path.insert(0, project_root)
 if True:
     from APD.config import APDConfig
     from APD.processor import APDProcessor
-    from APD.model import APDLMHeadModel
+    from APD.model import APDModel
+
 
 @dataclass
 class Word:
@@ -152,6 +162,7 @@ def generate_dataset(dataset_path: Path) -> Tuple[List[Word], List[Word], List[W
         f'Generated dataset - Train size: {len(train_words)}; Validation size: {len(validation_words)}; Test size: {len(test_words)}')
     return train_words, validation_words, test_words
 
+
 def create_dataloaders(train_words: List[Word], validation_words: List[Word], test_words: List[Word], config: APDConfig, batch_size: int = 32) -> Tuple[DataLoader, DataLoader, DataLoader]:
     train_data = IAMDataset(words=train_words, config=config)
     validation_data = IAMDataset(words=validation_words, config=config)
@@ -167,125 +178,656 @@ def create_dataloaders(train_words: List[Word], validation_words: List[Word], te
     return train_dataloader, validation_dataloader, test_dataloader
 
 
+class HybridTrainer:
+    def __init__(
+        self,
+        model,
+        config,
+        train_dataset,
+        val_dataset=None,
+        device='cuda',
+        learning_rate=2e-4,
+    ):
+        self.model = model.to(device)
+        self.config = config
+        self.device = device
 
-def train_model(model: torch.nn.Module, train_dataloader: DataLoader, validation_dataloader: DataLoader, epochs: int = 50, lr: float = 1e-4, device: str = 'mps'):
-    model.to(device)
-    optimiser = torch.optim.Adam(params=model.parameters(), lr=lr)
-
-    train_losses, train_accuracies = [], []
-    validation_losses, validation_accuracies = [], []
-
-    for epoch in range(epochs):
-        model.train()
-        epoch_losses, epoch_accuracies = [], []
-        for inputs in tqdm.tqdm(train_dataloader, total=len(train_dataloader), desc=f'Epoch {epoch + 1}'):
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-
-            optimiser.zero_grad()
-            outputs = model(**inputs)
-
-            outputs.loss.backward()
-            optimiser.step()
-
-            epoch_losses.append(outputs.loss.item())
-            epoch_accuracies.append(outputs.accuracy.item())
-
-        train_losses.append(sum(epoch_losses) / len(epoch_losses))
-        train_accuracies.append(sum(epoch_accuracies) / len(epoch_accuracies))
-
-        validation_loss, validation_accuracy = evaluate_model(
-            model, validation_dataloader, device)
-        validation_losses.append(validation_loss)
-        validation_accuracies.append(validation_accuracy)
-
-        print(f"Epoch: {epoch + 1} - Train loss: {train_losses[-1]:.4f}, Train accuracy: {train_accuracies[-1]:.4f}, "
-              f"Validation loss: {validation_losses[-1]:.4f}, Validation accuracy: {validation_accuracies[-1]:.4f}")
-
-    return model, train_losses, train_accuracies, validation_losses, validation_accuracies
-
-
-def evaluate_model(model: torch.nn.Module, dataloader: DataLoader, device: str = 'mps') -> Tuple[float, float]:
-    model.eval()
-    losses, accuracies = [], []
-    with torch.no_grad():
-        for inputs in tqdm.tqdm(dataloader, total=len(dataloader), desc='Evaluating'):
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            outputs = model(**inputs)
-            losses.append(outputs.loss.item())
-            accuracies.append(outputs.accuracy.item())
-
-    return sum(losses) / len(losses), sum(accuracies) / len(accuracies)
-
-
-def test_model(model: torch.nn.Module, test_words: List[Word], processor: APDProcessor, num_samples: int = 50):
-    model.eval()
-    model.to('cpu')
-
-    for test_word in test_words[:num_samples]:
-        image = Image.open(test_word.file_path).convert('RGB')
-        inputs = processor(
-            images=image,
-            texts=processor.tokeniser.bos_token,
-            return_tensors='pt'
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=4
         )
-        model_output = model.generate(inputs, processor, num_beams=3)
+        self.val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=4
+        ) if val_dataset else None
 
-        predicted_text = processor.tokeniser.decode(
-            model_output[0], skip_special_tokens=True)
+        self.optimizer = AdamW(model.parameters(), lr=learning_rate)
 
-        plt.figure(figsize=(10, 5))
-        plt.title(predicted_text, fontsize=24)
-        plt.imshow(np.array(image, dtype=np.uint8))
-        plt.xticks([]), plt.yticks([])
-        plt.show()
+    def train_epoch(self):
+        self.model.train()
+        total_loss = 0
+
+        for batch in tqdm.tqdm(self.train_loader, desc="Training"):
+            pixel_values = batch['pixel_values'].to(self.device)
+            input_ids = batch['input_ids'].to(self.device)
+
+            self.optimizer.zero_grad()
+
+            outputs = self.model(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+            )
+
+            dbnet_loss = outputs.dbnet_output['loss']
+            lm_loss = outputs.hidden_states.mean()
+
+            total_batch_loss = dbnet_loss + lm_loss
+
+            total_batch_loss.backward()
+            self.optimizer.step()
+
+            total_loss += total_batch_loss.item()
+
+        return total_loss / len(self.train_loader)
+
+
+class HybridInference:
+    def __init__(self, model, config, device='cuda'):
+        self.model = model.to(device)
+        self.config = config
+        self.device = device
+        self.model.eval()
+
+    @torch.no_grad()
+    def detect_and_generate(
+        self,
+        image: np.ndarray,
+        prompt: str = "",
+        max_length: int = 50
+    ) -> Dict:
+        processed_image = self._preprocess_image(image)
+        pixel_values = processed_image.unsqueeze(0).to(self.device)
+
+        input_ids = self._tokenize_prompt(prompt)
+
+        outputs = self.model(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            use_cache=True
+        )
+
+        text_regions = self._process_dbnet_output(
+            outputs.dbnet_output,
+            original_image=image
+        )
+
+        generated_text = self._generate_text(
+            outputs.hidden_states,
+            outputs.past_key_values,
+            max_length=max_length
+        )
+
+        return {
+            'detected_regions': text_regions,
+            'generated_text': generated_text
+        }
+
+    def _preprocess_image(self, image: np.ndarray) -> torch.Tensor:
+        h, w = self.config.image_size
+        image = cv2.resize(image, (w, h))
+        image = torch.from_numpy(image).float() / 255.0
+        image = image.permute(2, 0, 1)
+        return image
+
+    def _tokenize_prompt(self, prompt: str) -> torch.Tensor:
+        return torch.tensor([1]).to(self.device)
+
+    def _process_dbnet_output(
+        self,
+        dbnet_output: Dict,
+        original_image: np.ndarray
+    ) -> List[Dict]:
+        text_regions = []
+        predictions = dbnet_output['predictions']
+
+        for pred in predictions:
+            coords = self._rescale_coordinates(
+                pred['polygon'],
+                original_image.shape[:2]
+            )
+
+            text_regions.append({
+                'polygon': coords,
+                'confidence': pred['confidence']
+            })
+
+        return text_regions
+
+    def _generate_text(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_values: Tuple,
+        max_length: int
+    ) -> str:
+        return "Generated text"
+
+    def _rescale_coordinates(
+        self,
+        coords: np.ndarray,
+        original_size: Tuple[int, int]
+    ) -> np.ndarray:
+        h, w = self.config.image_size
+        orig_h, orig_w = original_size
+
+        coords[:, 0] *= (orig_w / w)
+        coords[:, 1] *= (orig_h / h)
+
+        return coords
+
+
+class IAMDatasetForDBNet(Dataset):
+    def __init__(self, words: List[Word], config: APDConfig, is_training: bool = True):
+        self.words = words
+        self.config = config
+        self.is_training = is_training
+
+        # Basic image transforms
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        ])
+
+        # Advanced augmentations for training
+        if is_training:
+            self.augmentor = Compose([
+                RandomBrightnessContrast(p=0.5),
+                GaussNoise(p=0.3),
+                Blur(blur_limit=3, p=0.3),
+                ShiftScaleRotate(
+                    shift_limit=0.0625,
+                    scale_limit=config.scale_range,
+                    rotate_limit=config.rotation_range,
+                    border_mode=cv2.BORDER_REPLICATE,
+                    p=config.aug_prob
+                ),
+            ])
+
+    def __len__(self):
+        return len(self.words)
+
+    def __getitem__(self, idx):
+        word = self.words[idx]
+        image = Image.open(word.file_path).convert('RGB')
+        image_np = np.array(image)
+        h, w = image_np.shape[:2]
+
+        # Get word bounding box (normalized coordinates)
+        bbox = np.array([0, 0, w, 0, w, h, 0, h],
+                        dtype=np.float32).reshape(-1, 2)
+        # Normalize coordinates to [0, 1]
+        bbox = bbox / np.array([w, h])[None, :]
+
+        # Apply augmentations if in training mode
+        if self.is_training:
+            augmented = self.augmentor(image=image_np)
+            image_np = augmented['image']
+
+        # Resize image
+        image_np = cv2.resize(image_np, self.config.image_size[::-1])
+
+        # Prepare targets
+        target = self._prepare_target(bbox, image_np.shape[:2])
+
+        # Transform image
+        image_tensor = self.transform(image_np)
+
+        return {
+            'image': image_tensor,
+            'prob_map': target['prob_map'],
+            'thresh_map': target['thresh_map'],
+            'binary_map': target['binary_map']
+        }
+
+    def _prepare_target(self, bbox: np.ndarray, image_size: Tuple[int, int]) -> Dict:
+        """Create DBNet targets"""
+        h, w = image_size
+
+        # Create empty target maps
+        prob_map = np.zeros((h, w), dtype=np.float32)
+        thresh_map = np.zeros((h, w), dtype=np.float32)
+        binary_map = np.zeros((h, w), dtype=np.float32)
+
+        # Convert normalized bbox back to pixel coordinates
+        bbox_pixels = bbox * np.array([w, h])[None, :]
+        bbox_pixels = bbox_pixels.astype(np.int32)
+
+        # Generate probability map
+        cv2.fillPoly(prob_map, [bbox_pixels], 1.0)
+
+        # Generate threshold map (simplified)
+        cv2.fillPoly(thresh_map, [bbox_pixels], 1.0)
+
+        # Generate binary map
+        cv2.fillPoly(binary_map, [bbox_pixels], 1.0)
+
+        return {
+            'prob_map': torch.from_numpy(prob_map).float(),
+            'thresh_map': torch.from_numpy(thresh_map).float(),
+            'binary_map': torch.from_numpy(binary_map).float()
+        }
+
+
+class DBNetTrainer:
+    def __init__(self, model, config, train_dataset, val_dataset=None, device='cuda'):
+        self.model = model.to(device)
+        self.config = config
+        self.device = device
+
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=4
+        )
+        self.val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=4
+        ) if val_dataset else None
+
+        # Optimizer with weight decay
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay
+        )
+
+        # Learning rate scheduler
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer,
+            T_max=config.max_epochs,
+            eta_min=config.min_learning_rate
+        )
+
+        # Initialize metrics tracking
+        self.metrics = {
+            'train_loss': [],
+            'val_hmean': [],
+            'val_precision': [],
+            'val_recall': []
+        }
+
+    def train_one_epoch(self, epoch: int):
+        self.model.train()
+        total_loss = 0
+
+        # Learning rate warmup
+        if epoch < self.config.warmup_epochs:
+            warmup_factor = (epoch + 1) / self.config.warmup_epochs
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.config.learning_rate * warmup_factor
+
+        for batch in tqdm.tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.config.max_epochs}"):
+            self.optimizer.zero_grad()
+
+            # Changed 'pixel_values' to 'image' to match dataset output
+            images = batch['image'].to(self.device)
+            targets = {
+                'prob_map': batch['prob_map'].to(self.device),
+                'thresh_map': batch['thresh_map'].to(self.device),
+                'binary_map': batch['binary_map'].to(self.device)
+            }
+
+            # Forward pass
+            outputs = self.model(images)
+
+            # Calculate losses
+            loss_dict = self._compute_losses(outputs, targets)
+            total_loss = sum(loss_dict.values())
+
+            # Backward pass
+            total_loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=5.0)
+
+            self.optimizer.step()
+
+        # Update learning rate
+        self.scheduler.step()
+
+        return total_loss / len(self.train_loader)
+
+    def _compute_losses(self, outputs, targets):
+        losses = {}
+
+# Add unsqueeze to match dimensions
+        prob_map = targets['prob_map'].unsqueeze(1)  # Add channel dimension
+        thresh_map = targets['thresh_map'].unsqueeze(1)
+        binary_map = targets['binary_map'].unsqueeze(1)
+
+        losses['prob_loss'] = F.binary_cross_entropy_with_logits(
+            outputs['prob_map'],
+            prob_map
+        )
+
+        losses['thresh_loss'] = F.l1_loss(
+            outputs['thresh_map'],
+            thresh_map
+        )
+
+        losses['binary_loss'] = F.binary_cross_entropy_with_logits(
+            outputs['binary_map'],
+            binary_map
+        )
+
+        return losses
+
+    def _dice_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute Dice loss"""
+        smooth = 1e-6
+        pred = torch.sigmoid(pred)
+
+        intersection = (pred * target).sum()
+        union = pred.sum() + target.sum()
+
+        dice = (2.0 * intersection + smooth) / (union + smooth)
+        return 1.0 - dice
+
+    def validate(self):
+        self.model.eval()
+        total_metrics = []
+
+        with torch.no_grad():
+            for batch in tqdm.tqdm(self.val_loader, desc="Validating"):
+                # Changed 'pixel_values' to 'image' to match dataset output
+                images = batch['image'].to(self.device)
+                targets = {
+                    'prob_map': batch['prob_map'].to(self.device),
+                    'thresh_map': batch['thresh_map'].to(self.device),
+                    'binary_map': batch['binary_map'].to(self.device)
+                }
+
+                # Forward pass
+                outputs = self.model(images)
+
+                # Calculate metrics
+                batch_metrics = self._calculate_metrics(outputs, targets)
+                total_metrics.append(batch_metrics)
+
+        # Average metrics across all batches
+        avg_metrics = {}
+        for key in total_metrics[0].keys():
+            avg_metrics[key] = sum(m[key]
+                                   for m in total_metrics) / len(total_metrics)
+
+        return avg_metrics
+
+    def _calculate_metrics(self, outputs, targets):
+        # Calculate precision, recall, and hmean using local implementation
+        metric = calculate_hmean(outputs, targets)
+        return {
+            'precision': metric['precision'],
+            'recall': metric['recall'],
+            'hmean': metric['hmean']
+        }
+
+
+class Visualizer:
+    @ staticmethod
+    def visualize_detection(image: np.ndarray, detected_regions: List[Dict],
+                            save_path: Optional[str] = None):
+        plt.figure(figsize=(10, 10))
+        plt.imshow(image)
+
+        # Plot each detected region
+        for region in detected_regions:
+            bbox = region['bbox']
+            confidence = region['confidence']
+
+            # Create polygon patch
+            polygon = patches.Polygon(
+                bbox,
+                fill=False,
+                edgecolor='red',
+                linewidth=2
+            )
+            plt.gca().add_patch(polygon)
+
+            # Add confidence score
+            center = bbox.mean(axis=0)
+            plt.text(
+                center[0], center[1],
+                f'{confidence:.2f}',
+                color='red',
+                fontsize=8,
+                bbox=dict(facecolor='white', alpha=0.7)
+            )
+
+        plt.axis('off')
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+            plt.close()
+        else:
+            plt.show()
+
+
+class DBNetInference:
+    def __init__(self, model, config, device='cuda'):
+        self.model = model.to(device)
+        self.config = config
+        self.device = device
+        self.model.eval()
+
+    @ torch.no_grad()
+    def detect(self, image: np.ndarray) -> List[Dict]:
+        # Preprocess image
+        processed_image = self._preprocess_image(image)
+
+        # Get model predictions
+        outputs = self.model(processed_image.unsqueeze(0).to(self.device))
+
+        # Post-process predictions to get bounding boxes
+        regions = self._post_process(outputs, image.shape[:2])
+
+        return regions
+
+    def _preprocess_image(self, image: np.ndarray) -> torch.Tensor:
+        image = cv2.resize(image, self.config.image_size[::-1])
+        image = torch.from_numpy(image).float() / 255.0
+        image = image.permute(2, 0, 1)
+        return image
+
+    def _post_process(self, outputs: Dict, original_size: Tuple[int, int]) -> List[Dict]:
+        prob_map = torch.sigmoid(outputs['prob_map']).cpu().numpy()[0]
+        binary_map = (
+            prob_map > self.config.min_text_confidence).astype(np.uint8)
+
+        # Find contours
+        contours, _ = cv2.findContours(
+            binary_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        regions = []
+        for contour in contours:
+            bbox = contour.reshape(-1, 2)
+            confidence = float(prob_map[bbox[:, 1], bbox[:, 0]].mean())
+
+            # Rescale coordinates to original image size
+            bbox = self._rescale_coordinates(bbox, original_size)
+
+            regions.append({
+                'bbox': bbox,
+                'confidence': confidence
+            })
+
+        return regions
+
+    def _rescale_coordinates(self, coords: np.ndarray, original_size: Tuple[int, int]) -> np.ndarray:
+        h, w = self.config.image_size
+        orig_h, orig_w = original_size
+
+        coords = coords.astype(float)
+        coords[:, 0] *= (orig_w / w)
+        coords[:, 1] *= (orig_h / h)
+
+        return coords
+
+
+def crop_polygon(image: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Simple polygon cropping function"""
+    rect = cv2.boundingRect(points)
+    x, y, w, h = rect
+    cropped = image[y:y+h, x:x+w].copy()
+
+    # Get mask
+    points = points - points.min(axis=0)
+    mask = np.zeros(cropped.shape[:2], np.uint8)
+    cv2.fillPoly(mask, [points.astype(np.int32)], (255))
+
+    # Apply mask
+    result = cv2.bitwise_and(cropped, cropped, mask=mask)
+    return result
+
+
+def calculate_hmean(predictions: List[Dict], targets: List[Dict]) -> Dict[str, float]:
+    """Simple implementation of hmean metric"""
+    eps = 1e-6
+    true_positives = 0
+    num_predictions = len(predictions)
+    num_targets = len(targets)
+
+    for pred in predictions:
+        for target in targets:
+            iou = calculate_iou(pred['bbox'], target['bbox'])
+            if iou > 0.5:  # IOU threshold
+                true_positives += 1
+                break
+
+    precision = true_positives / (num_predictions + eps)
+    recall = true_positives / (num_targets + eps)
+    hmean = 2 * precision * recall / (precision + recall + eps)
+
+    return {
+        'precision': precision,
+        'recall': recall,
+        'hmean': hmean
+    }
+
+
+def calculate_iou(box1: np.ndarray, box2: np.ndarray) -> float:
+    """Calculate IoU between two polygons"""
+    polygon1 = Polygon(box1)
+    polygon2 = Polygon(box2)
+
+    if not polygon1.is_valid or not polygon2.is_valid:
+        return 0
+
+    intersection = polygon1.intersection(polygon2).area
+    union = polygon1.union(polygon2).area
+
+    return intersection / union if union > 0 else 0
 
 
 def main():
     dataset_path = Path('./datasets/iam_words')
-    config = APDConfig(gpt2_hf_model='openai-community/gpt2')
+    config = APDConfig()
 
+    # Load dataset with new DBNet dataset class
     train_words, validation_words, test_words = load_dataset(dataset_path)
-    train_dataloader, validation_dataloader, test_dataloader = create_dataloaders(
-         train_words, validation_words, test_words, config)
 
-    print("Pre-trained GPT2 config:",
-         GPT2Config.from_pretrained('openai-community/gpt2'))
+    train_dataset = IAMDatasetForDBNet(train_words, config, is_training=True)
+    val_dataset = IAMDatasetForDBNet(
+        validation_words, config, is_training=False)
+    test_dataset = IAMDatasetForDBNet(test_words, config, is_training=False)
 
+    # Create model
+    model = APDModel(config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("Custom model config:", config.gpt2_config)
+    # Initialize trainer
+    trainer = DBNetTrainer(
+        model=model,
+        config=config,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        device=device
+    )
 
-    model = APDLMHeadModel(config)
+    # Add tensorboard logging
+    writer = SummaryWriter('runs/dbnet_experiment')
 
-    # Check if MPS is available
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("Using MPS device")
-    else:
-        device = torch.device("cpu")
-        print("MPS device not found, using CPU")
+    # Training loop with enhanced logging
+    best_hmean = 0
+    for epoch in range(config.max_epochs):
+        # Train
+        train_loss = trainer.train_one_epoch(epoch)
 
-    trained_model, train_losses, train_accuracies, validation_losses, validation_accuracies = train_model(
-        model, train_dataloader, validation_dataloader, device=device)
+        # Validate
+        val_metrics = trainer.validate()
 
-    # # Plot training results
-    # plt.figure(figsize=(12, 5))
-    # plt.subplot(1, 2, 1)
-    # plt.plot(train_losses, label='Train Loss')
-    # plt.plot(validation_losses, label='Validation Loss')
-    # plt.legend()
-    # plt.title('Loss')
-    # plt.subplot(1, 2, 2)
-    # plt.plot(train_accuracies, label='Train Accuracy')
-    # plt.plot(validation_accuracies, label='Validation Accuracy')
-    # plt.legend()
-    # plt.title('Accuracy')
-    # plt.show()
+        # Log metrics
+        writer.add_scalar('Loss/train', train_loss, epoch)
+        writer.add_scalar('Metrics/precision', val_metrics['precision'], epoch)
+        writer.add_scalar('Metrics/recall', val_metrics['recall'], epoch)
+        writer.add_scalar('Metrics/hmean', val_metrics['hmean'], epoch)
+        writer.add_scalar('LR', trainer.scheduler.get_last_lr()[0], epoch)
 
-    # # Test the model
-    # processor = APDProcessor(config)
-    # test_model(trained_model, test_words, processor)
+        # Save best model
+        if val_metrics['hmean'] > best_hmean:
+            best_hmean = val_metrics['hmean']
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': trainer.optimizer.state_dict(),
+                'scheduler_state_dict': trainer.scheduler.state_dict(),
+                'best_hmean': best_hmean,
+            }, 'best_model.pth')
+
+    writer.close()
+
+    # Initialize inferencer
+    inferencer = DBNetInference(model=model, config=config, device=device)
+    visualizer = Visualizer()
+
+    # Test inference with visualization
+    output_dir = Path('output_visualizations')
+    output_dir.mkdir(exist_ok=True)
+
+    for i, test_word in enumerate(test_words[:5]):
+        image = Image.open(test_word.file_path).convert('RGB')
+        image_np = np.array(image)
+
+        # Detect text regions
+        detected_regions = inferencer.detect(image_np)
+
+        # Visualize and save results
+        save_path = output_dir / f'detection_{i}.png'
+        visualizer.visualize_detection(
+            image_np,
+            detected_regions,
+            save_path=str(save_path)
+        )
+
+        print(f"Original text: {test_word.transcription}")
+        print(f"Detected regions: {len(detected_regions)}")
+        print(f"Visualization saved to {save_path}")
+        print("---")
+
+    # Add final test evaluation after training loop
+    test_metrics = trainer.validate(DataLoader(
+        test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4))
+    print(f"Final test metrics: {test_metrics}")
 
 
 if __name__ == '__main__':
     mp.set_start_method('spawn')
+    main()
+
     main()
