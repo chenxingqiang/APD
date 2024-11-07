@@ -1,4 +1,16 @@
-import os
-import sys
+# APD package initialization
+from .config import APDConfig
+from .data import load_dataset, IAMDatasetForDBNet
+from .model import APDModel
+from .dbnet import DBNetTrainer
+from .inference import DBNetInference, Visualizer
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+__all__ = [
+    'APDConfig',
+    'load_dataset',
+    'IAMDatasetForDBNet',
+    'APDModel',
+    'DBNetTrainer',
+    'DBNetInference',
+    'Visualizer'
+]

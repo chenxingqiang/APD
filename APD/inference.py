@@ -1,10 +1,13 @@
 import torch
-import cv2
 import numpy as np
-from typing import List, Tuple, Dict
+import cv2
+from typing import List, Dict, Tuple
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from typing import Optional
 
 
-class HybridInference:
+class DBNetInference:
     def __init__(self, model, config, device='cuda'):
         self.model = model.to(device)
         self.config = config
@@ -12,111 +15,109 @@ class HybridInference:
         self.model.eval()
 
     @torch.no_grad()
-    def detect_and_generate(
-        self,
-        image: np.ndarray,
-        prompt: str = "",
-        max_length: int = 50
-    ) -> Dict:
-        """
-        Detect text in image and generate response using GPT-2
-        """
-        # Preprocess image for DBNet
+    def detect(self, image: np.ndarray) -> List[Dict]:
+        # Preprocess image
         processed_image = self._preprocess_image(image)
-        pixel_values = processed_image.unsqueeze(0).to(self.device)
 
-        # Create input ids from prompt
-        input_ids = self._tokenize_prompt(prompt)
+        # Get model predictions
+        outputs = self.model(processed_image.unsqueeze(0).to(self.device))
 
-        # Model inference
-        outputs = self.model(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            use_cache=True
-        )
+        # Post-process predictions to get bounding boxes
+        regions = self._post_process(outputs, image.shape[:2])
 
-        # Process DBNet outputs
-        text_regions = self._process_dbnet_output(
-            outputs.dbnet_output,
-            original_image=image
-        )
-
-        # Generate text using GPT-2
-        generated_text = self._generate_text(
-            outputs.hidden_states,
-            outputs.past_key_values,
-            max_length=max_length
-        )
-
-        return {
-            'detected_regions': text_regions,
-            'generated_text': generated_text
-        }
+        return regions
 
     def _preprocess_image(self, image: np.ndarray) -> torch.Tensor:
-        """Preprocess image for model input"""
-        # Resize image
-        h, w = self.config.image_size
-        image = cv2.resize(image, (w, h))
-
-        # Normalize and convert to tensor
+        # Resize image to model's expected size
+        image = cv2.resize(image, self.config.image_size[::-1])
+        # Convert to float and normalize
         image = torch.from_numpy(image).float() / 255.0
-        image = image.permute(2, 0, 1)  # HWC to CHW
-
+        # Change from HWC to CHW format
+        image = image.permute(2, 0, 1)
         return image
 
-    def _tokenize_prompt(self, prompt: str) -> torch.Tensor:
-        """Convert prompt to input ids"""
-        # Implement tokenization based on your tokenizer
-        # This is a placeholder
-        return torch.tensor([1]).to(self.device)
+    def _post_process(self, outputs: Dict, original_size: Tuple[int, int]) -> List[Dict]:
+        # Get probability map and convert to numpy
+        prob_map = torch.sigmoid(outputs['prob_map']).cpu().numpy()[
+            0, 0]  # Get first batch, first channel
 
-    def _process_dbnet_output(
-        self,
-        dbnet_output: Dict,
-        original_image: np.ndarray
-    ) -> List[Dict]:
-        """Process DBNet detection output"""
-        # Get predicted text regions
-        text_regions = []
-        predictions = dbnet_output['predictions']
+        # Threshold to get binary map
+        binary_map = (prob_map > self.config.threshold).astype(np.uint8) * 255
 
-        # Process each detected region
-        for pred in predictions:
-            # Convert coordinates to original image scale
-            coords = self._rescale_coordinates(
-                pred['polygon'],
-                original_image.shape[:2]
-            )
+        # Find contours
+        contours, _ = cv2.findContours(
+            binary_map,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
 
-            text_regions.append({
-                'polygon': coords,
-                'confidence': pred['confidence']
+        regions = []
+        for contour in contours:
+            # Get confidence score from probability map
+            mask = np.zeros_like(binary_map)
+            cv2.drawContours(mask, [contour], -1, 1, -1)
+            confidence = float(np.mean(prob_map[mask == 1]))
+
+            # Convert contour to polygon
+            epsilon = 0.01 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            bbox = approx.reshape(-1, 2)
+
+            # Rescale coordinates to original image size
+            bbox = self._rescale_coordinates(bbox, original_size)
+
+            regions.append({
+                'bbox': bbox,
+                'confidence': confidence
             })
 
-        return text_regions
+        return regions
 
-    def _generate_text(
-        self,
-        hidden_states: torch.Tensor,
-        past_key_values: Tuple,
-        max_length: int
-    ) -> str:
-        """Generate text using GPT-2"""
-        # Implement text generation logic
-        # This is a placeholder
-        return "Generated text"
-
-    def _rescale_coordinates(
-        self,
-        coords: np.ndarray,
-        original_size: Tuple[int, int]
-    ) -> np.ndarray:
-        """Rescale coordinates to original image size"""
+    def _rescale_coordinates(self, coords: np.ndarray, original_size: Tuple[int, int]) -> np.ndarray:
         h, w = self.config.image_size
         orig_h, orig_w = original_size
 
+        coords = coords.astype(float)
         coords[:, 0] *= (orig_w / w)
         coords[:, 1] *= (orig_h / h)
 
         return coords
+
+
+class Visualizer:
+    @staticmethod
+    def visualize_detection(image: np.ndarray, detected_regions: List[Dict],
+                            save_path: Optional[str] = None):
+        plt.figure(figsize=(10, 10))
+        plt.imshow(image)
+
+        # Plot each detected region
+        for region in detected_regions:
+            bbox = region['bbox']
+            confidence = region['confidence']
+
+            # Create polygon patch
+            polygon = patches.Polygon(
+                bbox,
+                fill=False,
+                edgecolor='red',
+                linewidth=2
+            )
+            plt.gca().add_patch(polygon)
+
+            # Add confidence score
+            center = bbox.mean(axis=0)
+            plt.text(
+                center[0], center[1],
+                f'{confidence:.2f}',
+                color='red',
+                fontsize=8,
+                bbox=dict(facecolor='white', alpha=0.7)
+            )
+
+        plt.axis('off')
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+            plt.close()
+        else:
+            plt.show()

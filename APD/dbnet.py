@@ -2,6 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
+from torch.utils.data import DataLoader
+from typing import Dict
+import logging
+from tqdm import tqdm  # Add tqdm for progress bar
+
+logger = logging.getLogger(__name__)
 
 
 class DynamicFeatureFusion(nn.Module):
@@ -35,7 +41,7 @@ class DynamicFeatureFusion(nn.Module):
 
 
 class MultiScaleFeatureExtractor(nn.Module):
-    def __init__(self, in_channels=3, feature_channels=[64, 128, 256, 512]):
+    def __init__(self, in_channels=3, feature_channels=(64, 128, 256, 512)):
         super().__init__()
         self.layers = nn.ModuleList()
         current_channels = in_channels
@@ -133,3 +139,103 @@ class DBNet(nn.Module):
             'thresh_map': thresh_map,
             'binary_map': binary_map
         }
+
+
+class DBNetTrainer:
+    def __init__(
+        self,
+        model: nn.Module,
+        config,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        device: torch.device
+    ):
+        self.model = model.to(device)
+        self.config = config
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.device = device
+
+        # Initialize optimizer
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=config.learning_rate if hasattr(
+                config, 'learning_rate') else 1e-4
+        )
+
+    def compute_loss(self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Compute DBNet loss from outputs and targets"""
+        # Binary cross entropy for probability map
+        prob_loss = F.binary_cross_entropy_with_logits(
+            outputs['prob_map'].squeeze(1),
+            targets['prob_map']
+        )
+
+        # L1 loss for threshold map
+        thresh_loss = F.l1_loss(
+            torch.sigmoid(outputs['thresh_map'].squeeze(1)),
+            targets['thresh_map']
+        )
+
+        # Binary cross entropy for binary map
+        binary_loss = F.binary_cross_entropy_with_logits(
+            outputs['binary_map'].squeeze(1),
+            targets['binary_map']
+        )
+
+        # Total loss
+        total_loss = prob_loss + 0.5 * thresh_loss + 0.5 * binary_loss
+        return total_loss
+
+    def train_one_epoch(self, epoch: int) -> float:
+        """Train for one epoch"""
+        self.model.train()
+        total_loss = 0.0
+
+        # Add progress bar
+        pbar = tqdm(self.train_loader,
+                    desc=f'Epoch {epoch+1}/{self.config.max_epochs}')
+
+        for images, targets in pbar:
+            images = images.to(self.device)
+            targets = {k: v.to(self.device) for k, v in targets.items()}
+
+            self.optimizer.zero_grad()
+            outputs = self.model(images)
+            loss = self.compute_loss(outputs, targets)
+
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item()
+
+            # Update progress bar
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+        avg_loss = total_loss / len(self.train_loader)
+        return avg_loss
+
+    def validate(self) -> Dict:
+        """Validate the model"""
+        self.model.eval()
+        total_loss = 0.0
+
+        # Add progress bar for validation
+        pbar = tqdm(self.val_loader, desc='Validating')
+
+        with torch.no_grad():
+            for images, targets in pbar:
+                images = images.to(self.device)
+                targets = {k: v.to(self.device) for k, v in targets.items()}
+
+                outputs = self.model(images)
+                loss = self.compute_loss(outputs, targets)
+                total_loss += loss.item()
+
+                # Update progress bar
+                pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
+
+        metrics = {
+            'val_loss': total_loss / len(self.val_loader)
+        }
+        return metrics
