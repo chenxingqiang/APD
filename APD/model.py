@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
-import math
-from typing import Optional, Dict
+from typing import  Dict
 
 
 class APDModel(nn.Module):

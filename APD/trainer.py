@@ -1,4 +1,3 @@
-import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -52,6 +51,7 @@ class HybridTrainer:
             outputs = self.model(
                 pixel_values=pixel_values,
                 input_ids=input_ids,
+                dbnet_targets=dbnet_targets,
             )
 
             # Calculate losses

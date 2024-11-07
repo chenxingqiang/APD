@@ -158,3 +158,20 @@ datasets/iam_words/*
 
 
 ./docs/paper.mdruns/
+
+# Dataset files
+datasets/
+**/datasets/
+*.dataset
+*.h5
+*.tfrecord
+*.record
+*.zip
+*.tar
+*.tar.gz
+
+# Experiment runs
+runs/
+**/runs/
+runs/**/*
+./runs/
