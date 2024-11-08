@@ -1,10 +1,9 @@
 import torch
 import numpy as np
 import cv2
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from typing import Optional
 
 
 class DBNetInference:
